@@ -56,9 +56,12 @@ type subscriber struct {
 
 // recv loops to receive new messages from Redis and handle them
 // as publications.
-func (s *subscriber) recv() {
+func (s *subscriber) recv(onStop func()) {
 	// Close the connection once the subscriber stops receiving.
-	defer s.conn.Close()
+	defer func() {
+		s.conn.Close()
+		onStop()
+	}()
 
 	for {
 		switch x := s.conn.Receive().(type) {
@@ -231,7 +234,10 @@ func (b *redisBroker) Subscribe(topic string, handler broker.Handler, opts ...br
 	}
 
 	// Run the receiver routine.
-	go s.recv()
+	go s.recv(func() {
+		time.Sleep(3 * time.Second)
+		b.Subscribe(topic, handler, opts...)
+	})
 
 	if err := s.conn.Subscribe(s.topic); err != nil {
 		return nil, err
