@@ -28,18 +28,29 @@ type kBroker struct {
 }
 
 type subscriber struct {
-	group *kafka.ConsumerGroup
-	t     string
-	opts  broker.SubscribeOptions
+	k         *kBroker
+	topic     string
+	opts      broker.SubscribeOptions
+	offset    int64
+	gen       *kafka.Generation
+	partition int
+	handler   broker.Handler
+	reader    *kafka.Reader
+	exit      bool
+	done      chan struct{}
+	group     *kafka.ConsumerGroup
+	sync.RWMutex
 }
 
 type publication struct {
-	t   string
-	err error
-	m   *broker.Message
-	ctx context.Context
-	gen *kafka.Generation
-	mp  map[string]map[int]int64 // for commit offsets
+	topic      string
+	err        error
+	m          *broker.Message
+	ctx        context.Context
+	generation *kafka.Generation
+	reader     *kafka.Reader
+	km         kafka.Message
+	offsets    map[string]map[int]int64 // for commit offsets
 }
 
 func init() {
@@ -47,7 +58,7 @@ func init() {
 }
 
 func (p *publication) Topic() string {
-	return p.t
+	return p.topic
 }
 
 func (p *publication) Message() *broker.Message {
@@ -55,7 +66,10 @@ func (p *publication) Message() *broker.Message {
 }
 
 func (p *publication) Ack() error {
-	return p.gen.CommitOffsets(p.mp)
+	if logger.V(logger.TraceLevel, logger.DefaultLogger) {
+		logger.Tracef("commit offset %#+v\n", p.offsets)
+	}
+	return p.generation.CommitOffsets(p.offsets)
 }
 
 func (p *publication) Error() error {
@@ -67,11 +81,17 @@ func (s *subscriber) Options() broker.SubscribeOptions {
 }
 
 func (s *subscriber) Topic() string {
-	return s.t
+	return s.topic
 }
 
 func (s *subscriber) Unsubscribe() error {
-	return s.group.Close()
+	var err error
+	s.Lock()
+	defer s.Unlock()
+	if s.group != nil {
+		err = s.group.Close()
+	}
+	return err
 }
 
 func (k *kBroker) Address() string {
@@ -191,105 +211,151 @@ func (k *kBroker) Subscribe(topic string, handler broker.Handler, opts ...broker
 		o(&opt)
 	}
 
-	gcfg := kafka.ConsumerGroupConfig{
+	cgcfg := kafka.ConsumerGroupConfig{
 		ID:                    opt.Queue,
 		WatchPartitionChanges: true,
 		Brokers:               k.readerConfig.Brokers,
 		Topics:                []string{topic},
+		GroupBalancers:        []kafka.GroupBalancer{kafka.RangeGroupBalancer{}},
 	}
-	if err := gcfg.Validate(); err != nil {
+	if err := cgcfg.Validate(); err != nil {
 		return nil, err
 	}
 
-	group, err := kafka.NewConsumerGroup(gcfg)
+	group, err := kafka.NewConsumerGroup(cgcfg)
 	if err != nil {
 		return nil, err
 	}
 
-	sub := &subscriber{group: group, opts: opt, t: topic}
-
-	chErr := make(chan error)
+	sub := &subscriber{opts: opt, topic: topic, group: group}
 
 	go func() {
 		for {
-			gen, err := group.Next(k.opts.Context)
-			if err == kafka.ErrGroupClosed {
-				chErr <- nil
+			select {
+			case <-k.opts.Context.Done():
+				if logger.V(logger.TraceLevel, logger.DefaultLogger) {
+					logger.Trace("[segmentio] consumer group closed %v", k.opts.Context.Err())
+				}
+				// consumer group closed
 				return
-			} else if err != nil {
-				chErr <- err
-				return
-			}
-			chErr <- nil
-
-			assignments := gen.Assignments[topic]
-			for _, assignment := range assignments {
-				partition, offset := assignment.ID, assignment.Offset
-				p := &publication{t: topic, ctx: k.opts.Context, gen: gen}
-				p.mp = map[string]map[int]int64{p.t: {partition: offset}}
-
-				gen.Start(func(ctx context.Context) {
-					// create reader for this partition.
-					cfg := k.readerConfig
-					cfg.Topic = topic
-					cfg.Partition = partition
-					reader := kafka.NewReader(cfg)
-					defer reader.Close()
-					// seek to the last committed offset for this partition.
-					reader.SetOffset(offset)
-					for {
-						msg, err := reader.ReadMessage(ctx)
-						switch err {
-						case kafka.ErrGenerationEnded:
-							// generation has ended
-							if logger.V(logger.DebugLevel, logger.DefaultLogger) {
-								logger.Debug("[kafka] subscription closed")
-							}
-							return
-						case nil:
-							var m broker.Message
-							eh := k.opts.ErrorHandler
-							p.m = &m
-							if err := k.opts.Codec.Unmarshal(msg.Value, &m); err != nil {
-								p.err = err
-								p.m.Body = msg.Value
-								if eh != nil {
-									eh(p)
-								} else {
-									if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
-										logger.Errorf("[kafka]: failed to unmarshal: %v", err)
-									}
-								}
-								continue
-							}
-							err = handler(p)
-							if err == nil && opt.AutoAck {
-								if err = p.Ack(); err != nil {
-									logger.Errorf("[kafka]: unable to commit msg: %v", err)
-								}
-							} else if err != nil {
-								p.err = err
-								if eh != nil {
-									eh(p)
-								} else {
-									if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
-										logger.Errorf("[kafka]: subscriber error: %v", err)
-									}
-								}
-							}
+			default:
+				/*
+					group, err := kafka.NewConsumerGroup(cgcfg)
+					if err != nil {
+						if logger.V(logger.TraceLevel, logger.DefaultLogger) {
+							logger.Trace("[segmentio] consumer group error %v", err)
 						}
+						continue
 					}
-				})
+					sub.Lock()
+					*(sub.group) = *group
+					sub.Unlock()
+				*/
+				generation, err := group.Next(k.opts.Context)
+				switch err {
+				case kafka.ErrGroupClosed:
+					if logger.V(logger.TraceLevel, logger.DefaultLogger) {
+						logger.Tracef("[segmentio] consumer generation ended %v", k.opts.Context.Err())
+					}
+					continue
+				default:
+					if logger.V(logger.TraceLevel, logger.DefaultLogger) {
+						logger.Trace("[segmentio] consumer error %v", k.opts.Context.Err())
+					}
+					continue
+				case nil:
+					// continue
+				}
+
+				for _, t := range cgcfg.Topics {
+					assignments := generation.Assignments[t]
+					for _, assignment := range assignments {
+						cfg := k.readerConfig
+						cfg.Topic = t
+						cfg.Partition = assignment.ID
+						cfg.GroupID = ""
+						//					cfg.StartOffset = assignment.Offset
+						reader := kafka.NewReader(cfg)
+						reader.SetOffset(assignment.Offset)
+						cgh := &cgHandler{generation: generation, brokerOpts: k.opts, subOpts: opt, reader: reader, handler: handler}
+						generation.Start(cgh.run)
+					}
+				}
 			}
 		}
 	}()
 
-	err = <-chErr
-	if err != nil {
-		return nil, err
-	}
-
 	return sub, nil
+}
+
+type cgHandler struct {
+	topic      string
+	generation *kafka.Generation
+	brokerOpts broker.Options
+	subOpts    broker.SubscribeOptions
+	reader     *kafka.Reader
+	handler    broker.Handler
+}
+
+func (h *cgHandler) run(ctx context.Context) {
+	offsets := make(map[string]map[int]int64)
+	offsets[h.reader.Config().Topic] = make(map[int]int64)
+
+	defer h.reader.Close()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			msg, err := h.reader.ReadMessage(ctx)
+			switch err {
+			default:
+				if logger.V(logger.TraceLevel, logger.DefaultLogger) {
+					logger.Tracef("[segmentio] unexpected error: %v", err)
+				}
+				return
+			case kafka.ErrGenerationEnded:
+				// generation has ended
+				if logger.V(logger.TraceLevel, logger.DefaultLogger) {
+					logger.Trace("[segmentio] generation ended and subscription closed")
+				}
+				return
+			case nil:
+				var m broker.Message
+				eh := h.brokerOpts.ErrorHandler
+				offsets[msg.Topic][msg.Partition] = msg.Offset
+				p := &publication{generation: h.generation, m: &m, offsets: offsets}
+
+				if err := h.brokerOpts.Codec.Unmarshal(msg.Value, &m); err != nil {
+					p.err = err
+					p.m.Body = msg.Value
+					if eh != nil {
+						eh(p)
+					} else {
+						if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+							logger.Errorf("[segmentio]: failed to unmarshal: %v", err)
+						}
+					}
+					continue
+				}
+				err = h.handler(p)
+				if err == nil && h.subOpts.AutoAck {
+					if err = p.Ack(); err != nil {
+						logger.Errorf("[segmentio]: unable to commit msg: %v", err)
+					}
+				} else if err != nil {
+					p.err = err
+					if eh != nil {
+						eh(p)
+					} else {
+						if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+							logger.Errorf("[segmentio]: subscriber error: %v", err)
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 func (k *kBroker) String() string {
